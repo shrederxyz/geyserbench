@@ -1,24 +1,30 @@
-use futures_util::stream::StreamExt;
-use std::{
-    collections::HashMap,
-    error::Error,
-    sync::{Arc, Mutex},
-};
-use tokio::{sync::broadcast, task};
+use std::{ collections::HashMap, error::Error, sync::{ Arc, Mutex } };
+use futures::channel::mpsc::unbounded;
+use futures_util::{ stream::StreamExt, sink::SinkExt };
+use tokio::{ sync::broadcast, task };
 use tokio_stream::Stream;
 
 use crate::{
-    config::{Config, Endpoint},
-    utils::{get_current_timestamp, open_log_file, write_log_entry, Comparator, TransactionData},
+    config::{ Config, Endpoint },
+    utils::{ Comparator, TransactionData, get_current_timestamp, open_log_file, write_log_entry },
 };
 
 use super::GeyserProvider;
 
-pub mod jetstream_proto {
+pub mod jetstream {
+    #![allow(clippy::clone_on_ref_ptr)]
+    #![allow(clippy::missing_const_for_fn)]
+
     include!(concat!(env!("OUT_DIR"), "/jetstream.rs"));
+
+    pub const FILE_DESCRIPTOR_SET: &[u8] = tonic::include_file_descriptor_set!("proto_descriptors");
 }
 
-use jetstream_proto::jetstream_client::JetstreamClient;
+use jetstream::{
+    jetstream_client::JetstreamClient,
+    SubscribeRequest, SubscribeUpdate,
+    SubscribeRequestFilterTransactions,
+};
 
 pub struct JetstreamProvider;
 
@@ -30,7 +36,7 @@ impl GeyserProvider for JetstreamProvider {
         shutdown_tx: broadcast::Sender<()>,
         shutdown_rx: broadcast::Receiver<()>,
         start_time: f64,
-        comparator: Arc<Mutex<Comparator>>,
+        comparator: Arc<Mutex<Comparator>>
     ) -> task::JoinHandle<Result<(), Box<dyn Error + Send + Sync>>> {
         task::spawn(async move {
             process_jetstream_endpoint(
@@ -39,9 +45,8 @@ impl GeyserProvider for JetstreamProvider {
                 shutdown_tx,
                 shutdown_rx,
                 start_time,
-                comparator,
-            )
-            .await
+                comparator
+            ).await
         })
     }
 }
@@ -52,45 +57,36 @@ async fn process_jetstream_endpoint(
     shutdown_tx: broadcast::Sender<()>,
     mut shutdown_rx: broadcast::Receiver<()>,
     start_time: f64,
-    comparator: Arc<Mutex<Comparator>>,
+    comparator: Arc<Mutex<Comparator>>
 ) -> Result<(), Box<dyn Error + Send + Sync>> {
     let mut transaction_count = 0;
 
     let mut log_file = open_log_file(&endpoint.name)?;
 
-    log::info!(
-        "[{}] Connecting to endpoint: {}",
-        endpoint.name,
-        endpoint.url
-    );
+    log::info!("[{}] Connecting to endpoint: {}", endpoint.name, endpoint.url);
 
     let mut client = JetstreamClient::connect(endpoint.url).await?;
     log::info!("[{}] Connected successfully", endpoint.name);
 
-    let mut transactions: HashMap<String, jetstream_proto::SubscribeRequestFilterTransactions> =
-        HashMap::new();
-    transactions.insert(
-        String::from("account"),
-        jetstream_proto::SubscribeRequestFilterTransactions {
-            account_exclude: vec![],
-            account_include: vec![],
-            account_required: vec![config.account.clone()],
-        },
-    );
+    let mut transactions: HashMap<
+        String,
+        jetstream::SubscribeRequestFilterTransactions
+    > = HashMap::new();
+    transactions.insert(String::from("account"), jetstream::SubscribeRequestFilterTransactions {
+        account_exclude: vec![],
+        account_include: vec![],
+        account_required: vec![config.account.clone()],
+    });
 
-    let request = jetstream_proto::SubscribeRequest {
+    let request = jetstream::SubscribeRequest { 
         transactions,
         accounts: HashMap::new(),
         ping: None,
     };
 
-    fn reqstream(
-        req: jetstream_proto::SubscribeRequest,
-    ) -> impl Stream<Item = jetstream_proto::SubscribeRequest> {
-        tokio_stream::iter(vec![req])
-    }
-
-    let mut stream = client.subscribe(reqstream(request)).await?.into_inner();
+    let (mut subscribe_tx, subscribe_rx) = unbounded::<jetstream::SubscribeRequest>();
+    subscribe_tx.send(request).await?;
+    let mut stream = client.subscribe(subscribe_rx).await?.into_inner();
 
     'ploop: loop {
         tokio::select! {
@@ -101,7 +97,7 @@ async fn process_jetstream_endpoint(
 
             message = stream.next() => {
                 if let Some(Ok(msg)) = message {
-                    if let Some(jetstream_proto::subscribe_update::UpdateOneof::Transaction(tx)) = msg.update_oneof {
+                    if let Some(jetstream::subscribe_update::UpdateOneof::Transaction(tx)) = msg.update_oneof {
                         if let Some(tx_info) = &tx.transaction {
                             let account_keys = tx_info.account_keys
                                 .iter()
@@ -114,13 +110,7 @@ async fn process_jetstream_endpoint(
 
                                 write_log_entry(&mut log_file, timestamp, &endpoint.name, &signature)?;
 
-                                let mut comp = match comparator.lock() {
-                                    Ok(g) => g,
-                                    Err(e) => {
-                                        log::error!("Comparator mutex poisoned: {}", e);
-                                        e.into_inner()
-                                    }
-                                };
+                                let mut comp = comparator.lock().unwrap();
 
                                 comp.add(
                                     endpoint.name.clone(),
@@ -131,10 +121,10 @@ async fn process_jetstream_endpoint(
                                     },
                                 );
 
-                                if comp.get_all_seen_count() >= config.transactions as usize {
+                                if comp.get_valid_count() == config.transactions as usize {
                                     log::info!("Endpoint {} shutting down after {} transactions seen and {} by all workers",
                                         endpoint.name, transaction_count, config.transactions);
-                                    let _ = shutdown_tx.send(());
+                                    shutdown_tx.send(()).unwrap();
                                     break 'ploop;
                                 }
 

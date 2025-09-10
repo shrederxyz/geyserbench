@@ -1,6 +1,8 @@
+
 use serde::{Deserialize, Serialize};
 use std::{fs, path::Path};
 use yellowstone_grpc_proto::geyser::CommitmentLevel;
+
 
 #[derive(Debug, Deserialize, Serialize)]
 pub struct ConfigToml {
@@ -23,13 +25,13 @@ pub struct Endpoint {
     pub kind: EndpointKind,
 }
 
+
 #[derive(Debug, Deserialize, Serialize, Clone, PartialEq)]
 #[serde(rename_all = "lowercase")]
 pub enum EndpointKind {
     Yellowstone,
     Arpc,
     Thor,
-    Shredstream,
     Shreder,
     Jetstream,
 }
@@ -52,6 +54,7 @@ impl From<ArgsCommitment> for CommitmentLevel {
         }
     }
 }
+
 
 impl ConfigToml {
     pub fn load(path: &str) -> Result<Self, Box<dyn std::error::Error>> {
@@ -97,3 +100,4 @@ impl ConfigToml {
         }
     }
 }
+

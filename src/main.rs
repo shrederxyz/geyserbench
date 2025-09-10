@@ -1,4 +1,5 @@
 pub use {
+
     bs58,
     bytes::Bytes,
     env_logger,
@@ -6,23 +7,27 @@ pub use {
     log,
     serde::{Deserialize, Serialize},
     std::{
-        env,
         sync::{Arc, Mutex},
+        env,
     },
     tokio::{signal::ctrl_c, sync::broadcast, task},
 };
 
-mod analysis;
 mod config;
-mod providers;
 mod utils;
+mod analysis;
+mod providers;
 
-use utils::{get_current_timestamp, Comparator};
+use providers::GeyserProvider;
+use utils::{Comparator, get_current_timestamp};
+
 const CONFIG_PATH: &str = "config.toml";
+
 
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
     env_logger::Builder::from_env(env_logger::Env::default().default_filter_or("info")).init();
+
 
     let config = config::ConfigToml::load_or_create(CONFIG_PATH)?;
     log::info!("Loaded configuration");
@@ -32,8 +37,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let endpoint_count = config.endpoint.len();
 
     let start_time = get_current_timestamp();
-    // Expect each endpoint to eventually report; use endpoint count
-    let comparator = Arc::new(Mutex::new(Comparator::new(endpoint_count)));
+    let comparator = Arc::new(Mutex::new(Comparator::new(config.config.transactions as usize)));
+
 
     let mut handles = Vec::new();
     let endpoint_names: Vec<String> = config.endpoint.iter().map(|e| e.name.clone()).collect();
@@ -53,10 +58,11 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             start_time,
             shared_comparator,
         ));
+
     }
 
     tokio::spawn(async move {
-        if (ctrl_c().await).is_ok() {
+        if let Ok(_) = ctrl_c().await {
             println!("\nReceived Ctrl+C signal. Shutting down...");
             let _ = shutdown_tx.send(());
         }
@@ -64,20 +70,15 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     for handle in handles {
         match handle.await {
-            Ok(Ok(_)) => {}
+            Ok(Ok(_)) => {},
             Ok(Err(e)) => log::error!("Provider error: {:?}", e),
             Err(e) => log::error!("Task join error: {:?}", e),
         }
     }
 
-    let comp_guard = match comparator.lock() {
-        Ok(g) => g,
-        Err(poisoned) => {
-            log::error!("Comparator mutex poisoned; continuing with inner value");
-            poisoned.into_inner()
-        }
-    };
-    analysis::analyze_delays(&comp_guard, endpoint_names);
+
+    analysis::analyze_delays(&comparator.lock().unwrap(), endpoint_names);
+
 
     Ok(())
 }

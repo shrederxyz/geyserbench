@@ -1,5 +1,5 @@
-use crate::utils::{percentile, Comparator};
 use std::collections::HashMap;
+use crate::utils::{Comparator, percentile};
 
 #[derive(Default)]
 pub struct EndpointStats {
@@ -30,7 +30,7 @@ pub fn analyze_delays(comparator: &Comparator, endpoint_names: Vec<String>) {
         }
 
         if is_historical {
-            for endpoint in sig_data.keys() {
+            for (endpoint, _) in sig_data {
                 if let Some(stats) = endpoint_stats.get_mut(endpoint) {
                     stats.old_transactions += 1;
                 }
@@ -38,11 +38,10 @@ pub fn analyze_delays(comparator: &Comparator, endpoint_names: Vec<String>) {
             continue;
         }
 
-        if let Some((first_endpoint, first_tx)) = sig_data.iter().min_by(|a, b| {
-            a.1.timestamp
-                .partial_cmp(&b.1.timestamp)
-                .unwrap_or(std::cmp::Ordering::Equal)
-        }) {
+        if let Some((first_endpoint, first_tx)) = sig_data
+            .iter()
+            .min_by(|a, b| a.1.timestamp.partial_cmp(&b.1.timestamp).unwrap())
+        {
             if let Some(stats) = endpoint_stats.get_mut(first_endpoint) {
                 stats.first_detections += 1;
                 stats.total_valid_transactions += 1;
@@ -136,7 +135,7 @@ pub fn analyze_delays(comparator: &Comparator, endpoint_names: Vec<String>) {
                 let min_delay = stats.delays.iter().fold(f64::INFINITY, |a, &b| a.min(b));
 
                 let mut sorted_delays = stats.delays.clone();
-                sorted_delays.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
+                sorted_delays.sort_by(|a, b| a.partial_cmp(b).unwrap());
                 let p50 = percentile(&sorted_delays, 0.5);
                 let p95 = percentile(&sorted_delays, 0.95);
 

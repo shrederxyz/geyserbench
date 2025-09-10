@@ -4,23 +4,29 @@ use std::{
     sync::{Arc, Mutex},
 };
 
-use futures_util::stream::StreamExt;
+use futures_util::{stream::StreamExt, sink::SinkExt};
 use tokio::{sync::broadcast, task};
 use tokio_stream::Stream;
 
 use crate::{
     config::{Config, Endpoint},
-    utils::{get_current_timestamp, open_log_file, write_log_entry, Comparator, TransactionData},
+    utils::{Comparator, TransactionData, get_current_timestamp, open_log_file, write_log_entry},
 };
 
 use super::GeyserProvider;
 
-pub mod arpc_proto {
+pub mod arpc {
+    #![allow(clippy::clone_on_ref_ptr)]
+    #![allow(clippy::missing_const_for_fn)]
+
     include!(concat!(env!("OUT_DIR"), "/arpc.rs"));
+
+    pub const FILE_DESCRIPTOR_SET: &[u8] = tonic::include_file_descriptor_set!("proto_descriptors");
 }
 
-use arpc_proto::{
-    arpc_service_client::ArpcServiceClient, SubscribeRequest as ArpcSubscribeRequest,
+use arpc::{
+    arpc_service_client::ArpcServiceClient,
+    SubscribeRequest as ArpcSubscribeRequest,
     SubscribeRequestFilterTransactions,
 };
 
@@ -45,7 +51,7 @@ impl GeyserProvider for ArpcProvider {
                 start_time,
                 comparator,
             )
-            .await
+                .await
         })
     }
 }
@@ -112,13 +118,7 @@ async fn process_arpc_endpoint(
 
                             write_log_entry(&mut log_file, timestamp, &endpoint.name, &signature)?;
 
-                            let mut comp = match comparator.lock() {
-                                Ok(g) => g,
-                                Err(e) => {
-                                    log::error!("Comparator mutex poisoned: {}", e);
-                                    e.into_inner()
-                                }
-                            };
+                            let mut comp = comparator.lock().unwrap();
 
                             comp.add(
                                 endpoint.name.clone(),
@@ -129,10 +129,10 @@ async fn process_arpc_endpoint(
                                 },
                             );
 
-                            if comp.get_all_seen_count() >= config.transactions as usize {
+                            if comp.get_valid_count() == config.transactions as usize {
                                 log::info!("Endpoint {} shutting down after {} transactions seen and {} by all workers",
                                     endpoint.name, transaction_count, config.transactions);
-                                let _ = shutdown_tx.send(());
+                                shutdown_tx.send(()).unwrap();
                                 break 'ploop;
                             }
 

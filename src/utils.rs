@@ -2,8 +2,11 @@ use std::{
     collections::HashMap,
     fs::OpenOptions,
     io::Write,
-    time::{Duration, SystemTime, UNIX_EPOCH},
+    sync::{Arc, Mutex},
+    time::{SystemTime, UNIX_EPOCH},
 };
+
+use crate::config::ConfigToml;
 
 #[derive(Debug, Clone)]
 pub struct TransactionData {
@@ -29,16 +32,13 @@ impl Comparator {
     pub fn add(&mut self, from: String, data: TransactionData) {
         self.data
             .entry(data.signature.clone())
-            .or_default()
+            .or_insert_with(HashMap::new)
             .insert(from.clone(), data.clone());
 
-        let unique = self.get_valid_count();
-        let complete = self.get_all_seen_count();
-
+        let valid_count = self.get_valid_count();
         log::info!(
-            "unique: {}, complete: {} of {}",
-            unique,
-            complete,
+            "{}/{} total valid transactions",
+            valid_count,
             self.worker_count
         );
     }
@@ -46,25 +46,11 @@ impl Comparator {
     pub fn get_valid_count(&self) -> usize {
         self.data.len()
     }
-
-    pub fn get_all_seen_count(&self) -> usize {
-        self.data
-            .values()
-            .filter(|m| m.len() >= self.worker_count)
-            .count()
-    }
 }
 
 pub fn get_current_timestamp() -> f64 {
-    let now = SystemTime::now();
-    let since_epoch: Duration = match now.duration_since(UNIX_EPOCH) {
-        Ok(d) => d,
-        Err(e) => {
-            // System clock went backwards; log and clamp to 0
-            log::warn!("SystemTime error (clock skew): {}", e);
-            Duration::from_secs(0)
-        }
-    };
+    let start = SystemTime::now();
+    let since_epoch = start.duration_since(UNIX_EPOCH).expect("Time went backwards");
     since_epoch.as_secs_f64()
 }
 
@@ -90,6 +76,11 @@ pub fn write_log_entry(
     endpoint_name: &str,
     signature: &str,
 ) -> std::io::Result<()> {
-    let log_entry = format!("[{:.3}] [{}] {}\n", timestamp, endpoint_name, signature);
+    let log_entry = format!(
+        "[{:.3}] [{}] {}\n",
+        timestamp,
+        endpoint_name,
+        signature
+    );
     file.write_all(log_entry.as_bytes())
 }

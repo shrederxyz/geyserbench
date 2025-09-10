@@ -4,18 +4,20 @@ use std::{
     sync::{Arc, Mutex},
 };
 
-use futures_util::{sink::SinkExt, stream::StreamExt};
+use futures_util::{stream::StreamExt, sink::SinkExt};
 use tokio::{sync::broadcast, task};
 use yellowstone_grpc_client::GeyserGrpcClient;
 use yellowstone_grpc_proto::{
-    geyser::{subscribe_update::UpdateOneof, SubscribeRequest, SubscribeRequestPing},
+    geyser::{
+        subscribe_update::UpdateOneof, SubscribeRequest, SubscribeRequestPing,
+    },
     prelude::SubscribeRequestFilterTransactions,
     tonic::transport::ClientTlsConfig,
 };
 
 use crate::{
     config::{Config, Endpoint},
-    utils::{get_current_timestamp, open_log_file, write_log_entry, Comparator, TransactionData},
+    utils::{Comparator, TransactionData, get_current_timestamp, open_log_file, write_log_entry},
 };
 
 use super::GeyserProvider;
@@ -41,7 +43,7 @@ impl GeyserProvider for YellowstoneProvider {
                 start_time,
                 comparator,
             )
-            .await
+                .await
         })
     }
 }
@@ -114,54 +116,38 @@ async fn process_yellowstone_endpoint(
                     Some(Ok(msg)) => {
                         match msg.update_oneof {
                             Some(UpdateOneof::Transaction(tx_msg)) => {
-                                if let Some(tx) = tx_msg.transaction.as_ref() {
-                                    if let Some(msg) = tx.transaction.as_ref().and_then(|t| t.message.as_ref()) {
-                                        let accounts = msg
-                                            .account_keys
-                                            .iter()
-                                            .map(|key| bs58::encode(key).into_string())
-                                            .collect::<Vec<String>>();
+                                if let Some(tx) = tx_msg.transaction {
+                                    let accounts = tx.transaction.clone().unwrap().message.unwrap().account_keys
+                                        .iter()
+                                        .map(|key| bs58::encode(key).into_string())
+                                        .collect::<Vec<String>>();
 
-                                        if accounts.contains(&config.account) {
-                                            let timestamp = get_current_timestamp();
-                                            let signature = match tx.transaction.as_ref()
-                                                .and_then(|t| t.signatures.first()) {
-                                                Some(sig) => bs58::encode(sig).into_string(),
-                                                None => {
-                                                    log::warn!("[{}] Missing signature in transaction", endpoint.name);
-                                                    continue;
-                                                }
-                                            };
+                                    if accounts.contains(&config.account) {
+                                        let timestamp = get_current_timestamp();
+                                        let signature = bs58::encode(&tx.transaction.unwrap().signatures[0]).into_string();
 
-                                            write_log_entry(&mut log_file, timestamp, &endpoint.name, &signature)?;
+                                        write_log_entry(&mut log_file, timestamp, &endpoint.name, &signature)?;
 
-                                            let mut comp = match comparator.lock() {
-                                                Ok(g) => g,
-                                                Err(e) => {
-                                                    log::error!("Comparator mutex poisoned: {}", e);
-                                                    e.into_inner()
-                                                }
-                                            };
+                                        let mut comp = comparator.lock().unwrap();
 
-                                            comp.add(
-                                                endpoint.name.clone(),
-                                                TransactionData {
-                                                    timestamp,
-                                                    signature: signature.clone(),
-                                                    start_time,
-                                                },
-                                            );
+                                        comp.add(
+                                            endpoint.name.clone(),
+                                            TransactionData {
+                                                timestamp,
+                                                signature: signature.clone(),
+                                                start_time,
+                                            },
+                                        );
 
-                                            if comp.get_all_seen_count() >= config.transactions as usize {
-                                                log::info!("Endpoint {} shutting down after {} transactions seen and {} completed",
-                                                    endpoint.name, transaction_count, config.transactions);
-                                                let _ = shutdown_tx.send(());
-                                                break 'ploop;
-                                            }
-
-                                            log::info!("[{:.3}] [{}] {}", timestamp, endpoint.name, signature);
-                                            transaction_count += 1;
+                                        if comp.get_valid_count() == config.transactions as usize {
+                                            log::info!("Endpoint {} shutting down after {} transactions seen and {} by all workers",
+                                                endpoint.name, transaction_count, config.transactions);
+                                            shutdown_tx.send(()).unwrap();
+                                            break 'ploop;
                                         }
+
+                                        log::info!("[{:.3}] [{}] {}", timestamp, endpoint.name, signature);
+                                        transaction_count += 1;
                                     }
                                 }
                             },

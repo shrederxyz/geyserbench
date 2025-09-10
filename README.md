@@ -55,11 +55,6 @@ name = "Shreder.xyz"
 url = "http://0.0.0.0:10000"
 x_token = "YOUR_TOKEN_HERE"
 kind = "shreder"
-
-[[endpoint]]
-name = "Shredstream"
-url = "http://0.0.0.0:10000"
-kind = "shredstream"
 ```
 
 ### Configuration Options

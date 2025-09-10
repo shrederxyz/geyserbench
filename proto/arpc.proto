@@ -25,6 +25,8 @@ message SubscribeResponse {
   optional SubscribeResponseTransaction transaction = 3;
 }
 
+// Custom storage proto
+
 message SubscribeResponseTransaction {
   uint64 slot = 1;
   uint32 num_required_signatures = 2;
@@ -48,4 +50,6 @@ message CompiledInstruction {
   uint32 program_id_index = 1;
   bytes accounts = 2;
   bytes data = 3;
+
 }
+
