@@ -1,0 +1,14 @@
+[config]
+transactions = 1000
+account = "pAMMBay6oceH9fJKBRHGP5D4bD4sWpmSwMn52FMfXEA"
+commitment = "processed"
+
+[[endpoint]]
+name = "Endpoint 1"
+url = "http://arpc.fra.corvus-labs.io:20202"
+kind = "arpc"
+
+[[endpoint]]
+name = "Endpoint 2"
+url = "http://fra.corvus-labs.io:10101"
+kind = "yellowstone"

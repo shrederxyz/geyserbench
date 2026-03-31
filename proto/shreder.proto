@@ -1,15 +1,12 @@
 syntax = "proto3";
 
-package shreder;
+package shredstream;
 import "google/protobuf/timestamp.proto";
+import "shredstream.proto";
 
 service ShrederService {
   rpc SubscribeEntries(SubscribeEntriesRequest) returns (stream Entry);
   rpc SubscribeTransactions(stream SubscribeTransactionsRequest) returns (stream SubscribeTransactionsResponse);
-}
-
-message SubscribeEntriesRequest {
-  // tbd: we may want to add filters here
 }
 
 message SubscribeTransactionsRequest {
@@ -31,14 +28,6 @@ message SubscribeRequestFilterTransactions {
   repeated string account_include = 3;
   repeated string account_exclude = 4;
   repeated string account_required = 6;
-}
-
-message Entry {
-  // the slot that the entry is from
-  uint64 slot = 1;
-
-  // Serialized bytes of Vec<Entry>: https://docs.rs/solana-entry/latest/solana_entry/entry/struct.Entry.html
-  bytes entries = 2;
 }
 
 message MessageHeader {

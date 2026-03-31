@@ -1,159 +1,280 @@
+use crate::utils::{Comparator, TransactionData, percentile};
+use comfy_table::{ContentArrangement, Table};
+use serde_json::{Map, Value, json};
+use std::cmp::Ordering;
+
+#[cfg(target_os = "windows")]
+#[inline]
+fn table_preset() -> &'static str {
+    comfy_table::presets::ASCII_FULL
+}
+
+#[cfg(not(target_os = "windows"))]
+#[inline]
+fn table_preset() -> &'static str {
+    comfy_table::presets::UTF8_FULL
+}
 use std::collections::HashMap;
-use crate::utils::{Comparator, percentile};
+use std::time::Duration;
 
 #[derive(Default)]
 pub struct EndpointStats {
+    pub total_observations: usize,
     pub first_detections: usize,
-    pub total_valid_transactions: usize,
-    pub delays: Vec<f64>,
-    pub old_transactions: usize,
+    pub delays_ms: Vec<f64>,
+    pub backfill_transactions: usize,
 }
 
-pub fn analyze_delays(comparator: &Comparator, endpoint_names: Vec<String>) {
-    let all_signatures = &comparator.data;
+#[derive(Debug, Default, Clone)]
+pub struct EndpointSummary {
+    pub name: String,
+    pub first_share: f64,
+    pub p50_delay_ms: Option<f64>,
+    pub p95_delay_ms: Option<f64>,
+    pub p99_delay_ms: Option<f64>,
+    pub valid_transactions: usize,
+    pub first_detections: usize,
+    pub backfill_transactions: usize,
+}
+
+#[derive(Debug, Clone)]
+pub struct RunSummary {
+    pub endpoints: Vec<EndpointSummary>,
+    pub fastest_endpoint: Option<String>,
+    pub has_data: bool,
+    pub total_signatures: usize,
+    pub backfill_signatures: usize,
+}
+
+pub fn compute_run_summary(comparator: &Comparator, endpoint_names: &[String]) -> RunSummary {
     let mut endpoint_stats: HashMap<String, EndpointStats> = HashMap::new();
+    let expected_producers = endpoint_names.len();
+    let mut total_signatures = 0usize;
+    let mut backfill_signatures = 0usize;
 
     for endpoint_name in endpoint_names {
-        endpoint_stats.insert(endpoint_name, EndpointStats::default());
+        endpoint_stats.insert(endpoint_name.clone(), EndpointStats::default());
     }
 
-    let mut fastest_endpoint = None;
-    let mut highest_first_detection_rate = 0.0;
-
-    for sig_data in all_signatures.values() {
-        let mut is_historical = false;
-        for tx_data in sig_data.values() {
-            if tx_data.timestamp < tx_data.start_time {
-                is_historical = true;
-                break;
-            }
+    for sig_entry in comparator.iter() {
+        let sig_data = sig_entry.value();
+        if expected_producers > 0 && sig_data.len() != expected_producers {
+            // Skip partial observations to mirror backend results
+            continue;
         }
 
+        let is_historical = sig_data
+            .values()
+            .any(|tx| tx.wallclock_secs < tx.start_wallclock_secs);
+
         if is_historical {
-            for (endpoint, _) in sig_data {
+            backfill_signatures += 1;
+            for endpoint in sig_data.keys() {
                 if let Some(stats) = endpoint_stats.get_mut(endpoint) {
-                    stats.old_transactions += 1;
+                    stats.backfill_transactions += 1;
                 }
             }
             continue;
         }
 
-        if let Some((first_endpoint, first_tx)) = sig_data
-            .iter()
-            .min_by(|a, b| a.1.timestamp.partial_cmp(&b.1.timestamp).unwrap())
-        {
-            if let Some(stats) = endpoint_stats.get_mut(first_endpoint) {
-                stats.first_detections += 1;
-                stats.total_valid_transactions += 1;
-            }
+        let Some((first_endpoint, first_tx)) =
+            sig_data.iter().min_by_key(|(_, tx)| tx.elapsed_since_start)
+        else {
+            continue;
+        };
 
-            for (endpoint, tx) in sig_data {
-                if endpoint != first_endpoint {
-                    if let Some(stats) = endpoint_stats.get_mut(endpoint) {
-                        stats
-                            .delays
-                            .push((tx.timestamp - first_tx.timestamp) * 1000.0);
-                        stats.total_valid_transactions += 1;
-                    }
+        total_signatures += 1;
+        let first_endpoint_name = first_endpoint.clone();
+
+        for (endpoint, tx) in sig_data.iter() {
+            if let Some(stats) = endpoint_stats.get_mut(endpoint) {
+                stats.total_observations += 1;
+                if endpoint == &first_endpoint_name {
+                    stats.first_detections += 1;
+                    stats.delays_ms.push(0.0);
+                } else {
+                    let delay_ms = diff_ms(tx, first_tx).max(0.0);
+                    stats.delays_ms.push(delay_ms);
                 }
             }
         }
     }
 
-    for (endpoint, stats) in &endpoint_stats {
-        if stats.total_valid_transactions > 0 {
-            let detection_rate =
-                stats.first_detections as f64 / stats.total_valid_transactions as f64;
-            if detection_rate > highest_first_detection_rate {
-                highest_first_detection_rate = detection_rate;
-                fastest_endpoint = Some(endpoint.clone());
-            }
-        }
-    }
+    let endpoints: Vec<EndpointSummary> = endpoint_stats
+        .into_iter()
+        .map(|(endpoint, stats)| build_summary(endpoint, stats, total_signatures))
+        .collect();
 
+    let has_data = total_signatures > 0;
+
+    let fastest_endpoint = endpoints
+        .iter()
+        .filter(|summary| summary.valid_transactions > 0)
+        .min_by(|a, b| compare_latency(a, b))
+        .map(|summary| summary.name.clone());
+
+    RunSummary {
+        endpoints,
+        fastest_endpoint,
+        has_data,
+        total_signatures,
+        backfill_signatures,
+    }
+}
+
+pub fn display_run_summary(summary: &RunSummary) {
     println!("\nFinished test results");
     println!("--------------------------------------------");
 
-    if let Some(fastest) = fastest_endpoint.as_ref() {
-        let fastest_stats = &endpoint_stats[fastest];
-        let win_rate = (fastest_stats.first_detections as f64
-            / fastest_stats.total_valid_transactions as f64)
-            * 100.0;
-        println!(
-            "{}: Win rate {:.2}%, avg delay 0.00ms (fastest)",
-            fastest, win_rate
-        );
+    if !summary.has_data {
+        println!("Not enough data");
+    } else {
+	let fastest_name_ref = summary.fastest_endpoint.as_deref();
+        let mut summary_rows: Vec<&EndpointSummary> = summary.endpoints.iter().collect();
+        summary_rows.sort_by(|a, b| compare_latency(a, b));
 
-        for (endpoint, stats) in &endpoint_stats {
-            if endpoint != fastest && stats.total_valid_transactions > 0 {
-                let win_rate =
-                    (stats.first_detections as f64 / stats.total_valid_transactions as f64) * 100.0;
-                let avg_delay = if stats.delays.is_empty() {
-                    0.0
-                } else {
-                    stats.delays.iter().sum::<f64>() / stats.delays.len() as f64
-                };
+        for summary in summary_rows {
+            if summary.valid_transactions == 0 {
+                println!("{}: Not enough data", summary.name);
+                continue;
+            }
 
+            let raw_win_rate = format_percent(summary.first_share);
+            let win_rate = if raw_win_rate == "—" {
+                raw_win_rate
+            } else {
+                format!("{}%", raw_win_rate)
+            };
+            let is_fastest = fastest_name_ref == Some(summary.name.as_str());
+
+            if is_fastest {
                 println!(
-                    "{}: Win rate {:.2}%, avg delay {:.2}ms",
-                    endpoint, win_rate, avg_delay
+                    "{}: Win rate {}, p50 0.00ms (fastest)",
+                    summary.name, win_rate,
                 );
+            } else {
+                let p50_delay = summary
+                    .p50_delay_ms
+                    .map(|v| format!("{:.2}ms", v))
+                    .unwrap_or_else(|| "—".to_string());
+                println!("{}: Win rate {}, p50 {}", summary.name, win_rate, p50_delay);
             }
         }
-    } else {
-        println!("Not enough data");
     }
 
     println!("\nDetailed test results");
     println!("--------------------------------------------");
 
-    if let Some(fastest) = fastest_endpoint {
-        println!("\nFastest Endpoint: {}", fastest);
-        let fastest_stats = &endpoint_stats[&fastest];
-        println!(
-            "  First detections: {} out of {} valid transactions ({:.2}%)",
-            fastest_stats.first_detections,
-            fastest_stats.total_valid_transactions,
-            (fastest_stats.first_detections as f64 / fastest_stats.total_valid_transactions as f64)
-                * 100.0
-        );
-        if fastest_stats.old_transactions > 0 {
-            println!(
-                "  Historical transactions detected: {}",
-                fastest_stats.old_transactions
-            );
-        }
-
-        println!("\nDelays relative to fastest endpoint:");
-        for (endpoint, stats) in &endpoint_stats {
-            if endpoint != &fastest && !stats.delays.is_empty() {
-                let avg_delay = stats.delays.iter().sum::<f64>() / stats.delays.len() as f64;
-                let max_delay = stats
-                    .delays
-                    .iter()
-                    .fold(f64::NEG_INFINITY, |a, &b| a.max(b));
-                let min_delay = stats.delays.iter().fold(f64::INFINITY, |a, &b| a.min(b));
-
-                let mut sorted_delays = stats.delays.clone();
-                sorted_delays.sort_by(|a, b| a.partial_cmp(b).unwrap());
-                let p50 = percentile(&sorted_delays, 0.5);
-                let p95 = percentile(&sorted_delays, 0.95);
-
-                println!("\n{}:", endpoint);
-                println!("  Average delay: {:.2} ms", avg_delay);
-                println!("  Median delay: {:.2} ms", p50);
-                println!("  95th percentile: {:.2} ms", p95);
-                println!("  Min/Max delay: {:.2}/{:.2} ms", min_delay, max_delay);
-                println!("  Valid transactions: {}", stats.total_valid_transactions);
-                if stats.old_transactions > 0 {
-                    println!(
-                        "  Historical transactions detected: {}",
-                        stats.old_transactions
-                    );
-                }
-            }
-        }
-    } else {
+    if !summary.has_data {
         println!("Not enough data");
+        return;
+    }
+
+    let mut table_rows: Vec<&EndpointSummary> = summary.endpoints.iter().collect();
+    table_rows.sort_by(|a, b| compare_latency(a, b));
+
+    let mut table = Table::new();
+    table.load_preset(table_preset());
+    table.set_content_arrangement(ContentArrangement::Dynamic);
+    table.set_header(vec![
+        "Endpoint", "First %", "P50 ms", "P95 ms", "P99 ms", "Valid Tx", "Firsts", "Backfill",
+    ]);
+
+    for summary in table_rows {
+        table.add_row(vec![
+            summary.name.clone(),
+            format_percent(summary.first_share),
+            format_latency_value(summary.p50_delay_ms),
+            format_latency_value(summary.p95_delay_ms),
+            format_latency_value(summary.p99_delay_ms),
+            summary.valid_transactions.to_string(),
+            summary.first_detections.to_string(),
+            summary.backfill_transactions.to_string(),
+        ]);
+    }
+
+    println!("{}", table);
+}
+
+pub fn build_metrics_report(summary: &RunSummary) -> Value {
+    let mut per_endpoint = Map::new();
+    for endpoint in &summary.endpoints {
+        let payload = json!({
+            "first_detection_rate": endpoint.first_share,
+            "p50_latency_ms": endpoint.p50_delay_ms,
+            "p95_latency_ms": endpoint.p95_delay_ms,
+            "p99_latency_ms": endpoint.p99_delay_ms,
+            "observations": endpoint.valid_transactions,
+            "first_detections": endpoint.first_detections,
+            "backfill_transactions": endpoint.backfill_transactions,
+        });
+        per_endpoint.insert(endpoint.name.clone(), payload);
+    }
+
+    json!({
+        "total_signatures": summary.total_signatures,
+        "backfill_signatures": summary.backfill_signatures,
+        "per_endpoint": per_endpoint
+    })
+}
+
+fn diff_ms(tx: &TransactionData, first_tx: &TransactionData) -> f64 {
+    let delta: Duration = tx
+        .elapsed_since_start
+        .saturating_sub(first_tx.elapsed_since_start);
+    delta.as_secs_f64() * 1_000.0
+}
+
+fn build_summary(
+    endpoint: String,
+    stats: EndpointStats,
+    total_signatures: usize,
+) -> EndpointSummary {
+    let mut summary = EndpointSummary {
+        name: endpoint,
+        valid_transactions: stats.total_observations,
+        first_detections: stats.first_detections,
+        backfill_transactions: stats.backfill_transactions,
+        ..Default::default()
+    };
+
+    if total_signatures > 0 {
+        summary.first_share = stats.first_detections as f64 / total_signatures as f64;
+    }
+
+    if !stats.delays_ms.is_empty() {
+        let mut sorted = stats.delays_ms.clone();
+        sorted.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
+        summary.p50_delay_ms = Some(percentile(&sorted, 0.5));
+        summary.p95_delay_ms = Some(percentile(&sorted, 0.95));
+        summary.p99_delay_ms = Some(percentile(&sorted, 0.99));
+    }
+
+    summary
+}
+
+fn format_latency_value(value: Option<f64>) -> String {
+    value
+        .map(|v| format!("{:.2}", v))
+        .unwrap_or_else(|| "—".to_string())
+}
+
+fn compare_latency(lhs: &EndpointSummary, rhs: &EndpointSummary) -> Ordering {
+    match (lhs.p50_delay_ms, rhs.p50_delay_ms) {
+        (Some(l), Some(r)) => l
+            .partial_cmp(&r)
+            .unwrap_or(Ordering::Equal)
+            .then_with(|| lhs.name.cmp(&rhs.name)),
+        (Some(_), None) => Ordering::Less,
+        (None, Some(_)) => Ordering::Greater,
+        (None, None) => lhs.name.cmp(&rhs.name),
+    }
+}
+
+fn format_percent(value: f64) -> String {
+    if value.is_finite() {
+        format!("{:.2}", value * 100.0)
+    } else {
+        "—".to_string()
     }
 }
