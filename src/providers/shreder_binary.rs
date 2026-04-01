@@ -1,10 +1,10 @@
-use std::{collections::HashMap, error::Error, sync::atomic::Ordering};
-
 use futures::{SinkExt, channel::mpsc::unbounded};
 use futures_util::stream::StreamExt;
 use solana_pubkey::Pubkey;
+use solana_transaction::versioned::VersionedTransaction;
+use std::{collections::HashMap, error::Error, sync::atomic::Ordering};
 use tokio::task;
-use tracing::{Level, info};
+use tracing::{Level, info, trace};
 
 use crate::{
     config::{Config, Endpoint},
@@ -19,29 +19,29 @@ use super::{
 };
 
 #[allow(clippy::all, dead_code)]
-pub mod arpc {
-    include!(concat!(env!("OUT_DIR"), "/arpc.rs"));
+pub mod shreder_binary {
+    include!(concat!(env!("OUT_DIR"), "/shreder_binary.rs"));
 }
 
-use arpc::{
-    SubscribeRequest as ArpcSubscribeRequest, SubscribeRequestFilterTransactions,
-    arpc_service_client::ArpcServiceClient,
+use shreder_binary::{
+    SubscribeBinaryTransactionsRequest, SubscribeRequestFilterBinaryTransactions,
+    shreder_binary_service_client::ShrederBinaryServiceClient,
 };
 
-pub struct ArpcProvider;
+pub struct ShrederBinaryProvider;
 
-impl GeyserProvider for ArpcProvider {
+impl GeyserProvider for ShrederBinaryProvider {
     fn process(
         &self,
         endpoint: Endpoint,
         config: Config,
         context: ProviderContext,
     ) -> task::JoinHandle<Result<(), Box<dyn Error + Send + Sync>>> {
-        task::spawn(async move { process_arpc_endpoint(endpoint, config, context).await })
+        task::spawn(async move { process_shreder_binary_endpoint(endpoint, config, context).await })
     }
 }
 
-async fn process_arpc_endpoint(
+async fn process_shreder_binary_endpoint(
     endpoint: Endpoint,
     config: Config,
     context: ProviderContext,
@@ -73,30 +73,33 @@ async fn process_arpc_endpoint(
 
     info!(endpoint = %endpoint_name, url = %endpoint_url, "Connecting");
 
-    let mut client = ArpcServiceClient::connect(endpoint_url.clone())
+    let mut client = ShrederBinaryServiceClient::connect(endpoint_url.clone())
         .await
         .unwrap_or_else(|err| fatal_connection_error(&endpoint_name, err));
     info!(endpoint = %endpoint_name, "Connected");
 
-    let transactions = HashMap::from([(
-        "account".to_string(),
-        SubscribeRequestFilterTransactions {
-            account_include: vec![config.account.clone()],
+    let mut transactions: HashMap<String, SubscribeRequestFilterBinaryTransactions> =
+        HashMap::with_capacity(1);
+    transactions.insert(
+        String::from("account"),
+        SubscribeRequestFilterBinaryTransactions {
             account_exclude: vec![],
-            account_required: vec![],
+            account_include: vec![],
+            account_required: vec![config.account.clone()],
         },
-    )]);
+    );
 
-    let request = ArpcSubscribeRequest {
-        transactions,
-        ping_id: Some(0),
-    };
-
-    let (mut subscribe_tx, subscribe_rx) = unbounded::<ArpcSubscribeRequest>();
+    let request = SubscribeBinaryTransactionsRequest { transactions };
+    let (mut subscribe_tx, subscribe_rx) =
+        unbounded::<shreder_binary::SubscribeBinaryTransactionsRequest>();
     subscribe_tx.send(request).await?;
-    let mut stream = client.subscribe(subscribe_rx).await?.into_inner();
+    let mut stream = client
+        .subscribe_binary_transactions(subscribe_rx)
+        .await?
+        .into_inner();
 
     let mut accumulator = TransactionAccumulator::new();
+
     let mut transaction_count = 0usize;
 
     loop {
@@ -107,17 +110,29 @@ async fn process_arpc_endpoint(
             }
 
             message = stream.next() => {
-                let Some(Ok(msg)) = message else { continue };
-                let Some(tx) = msg.transaction else { continue };
+                if let Some(m) = message.as_ref() {
+                    trace!(endpoint = %endpoint_name, ?m, "Received stream message");
+                }
 
-                let has_account = tx.account_keys
+                let Some(Ok(msg)) = message else { continue };
+                let Some(tx_update) = msg.transaction.as_ref() else { continue };
+                let Some(tx) = tx_update.transaction.as_ref() else { continue };
+
+                let raw = &tx.binary_transaction;
+                if raw.is_empty() { continue }
+                let Ok(versioned_tx) = bincode::deserialize::<VersionedTransaction>(raw) else { continue };
+
+                let has_account = versioned_tx
+                    .message
+                    .static_account_keys()
                     .iter()
-                    .any(|k| k.as_slice() == account_pubkey.as_ref());
+                    .any(|k| k == &account_pubkey);
                 if !has_account { continue }
 
                 let wallclock = get_current_timestamp();
                 let elapsed = start_instant.elapsed();
-                let signature = tx.signatures
+                let signature = tx
+                    .signatures
                     .first()
                     .map(|s| bs58::encode(s).into_string())
                     .unwrap_or_default();

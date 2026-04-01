@@ -1,50 +1,23 @@
-use std::{
-    collections::HashMap,
-    error::Error,
-    sync::{Arc, Mutex},
-};
-
-use futures_util::{stream::StreamExt, sink::SinkExt};
-use tokio::{sync::broadcast, task};
-use publisher::{
-    event_publisher_client::EventPublisherClient,
-    Empty, StreamResponse, SubscribeWalletRequest,
-    
-};
-use thor_streamer::types::{
-    MessageWrapper, SlotStatusEvent, TransactionEvent, TransactionEventWrapper, UpdateAccountEvent,
-    message_wrapper::EventMessage,
-};
-use prost::Message;
-use tonic::transport::Uri;
-use tonic::{Request, Streaming};
-use tokio_stream::Stream;
+use std::{error::Error, sync::atomic::Ordering, time::Duration};
 
 use crate::{
     config::{Config, Endpoint},
-    utils::{Comparator, TransactionData, get_current_timestamp, open_log_file, write_log_entry},
+    utils::{TransactionData, get_current_timestamp, open_log_file, write_log_entry},
 };
 
-use super::GeyserProvider;
+use futures_util::StreamExt;
+use solana_pubkey::Pubkey;
+use thorstreamer_grpc_client::{ClientConfig, ThorClient, parse_message};
+use thorstreamer_grpc_client::proto::thor_streamer::types::message_wrapper::EventMessage;
+use tokio::task;
+use tracing::{Level, info};
 
-pub mod thor_streamer {
-    #![allow(clippy::clone_on_ref_ptr)]
-    #![allow(clippy::missing_const_for_fn)]
-    
-    pub mod types {
-        include!(concat!(env!("OUT_DIR"), "/thor_streamer.types.rs"));
-    }
-}
-
-pub mod publisher {
-    #![allow(clippy::clone_on_ref_ptr)]
-    #![allow(clippy::missing_const_for_fn)]
-    
-    include!(concat!(env!("OUT_DIR"), "/publisher.rs"));
-    
-    pub const FILE_DESCRIPTOR_SET: &[u8] = tonic::include_file_descriptor_set!("proto_descriptors");
-}
-
+use super::{
+    GeyserProvider, ProviderContext,
+    common::{
+        TransactionAccumulator, build_signature_envelope, enqueue_signature, fatal_connection_error,
+    },
+};
 
 pub struct ThorProvider;
 
@@ -53,118 +26,149 @@ impl GeyserProvider for ThorProvider {
         &self,
         endpoint: Endpoint,
         config: Config,
-        shutdown_tx: broadcast::Sender<()>,
-        shutdown_rx: broadcast::Receiver<()>,
-        start_time: f64,
-        comparator: Arc<Mutex<Comparator>>,
+        context: ProviderContext,
     ) -> task::JoinHandle<Result<(), Box<dyn Error + Send + Sync>>> {
-        task::spawn(async move {
-            process_thor_endpoint(
-                endpoint,
-                config,
-                shutdown_tx,
-                shutdown_rx,
-                start_time,
-                comparator,
-            )
-            .await
-        })
+        task::spawn(async move { process_thor_endpoint(endpoint, config, context).await })
     }
 }
 
 async fn process_thor_endpoint(
     endpoint: Endpoint,
     config: Config,
-    shutdown_tx: broadcast::Sender<()>,
-    mut shutdown_rx: broadcast::Receiver<()>,
-    start_time: f64,
-    comparator: Arc<Mutex<Comparator>>,
+    context: ProviderContext,
 ) -> Result<(), Box<dyn Error + Send + Sync>> {
-    let mut transaction_count = 0;
+    let ProviderContext {
+        shutdown_tx,
+        mut shutdown_rx,
+        start_wallclock_secs,
+        start_instant,
+        comparator,
+        signature_tx,
+        shared_counter,
+        shared_shutdown,
+        target_transactions,
+        total_producers,
+        progress,
+    } = context;
+    let signature_sender = signature_tx;
+    let account_pubkey = config.account.parse::<Pubkey>()?;
+    let endpoint_name = endpoint.name.clone();
 
-    let mut log_file = open_log_file(&endpoint.name)?;
+    let mut log_file = if tracing::enabled!(Level::TRACE) {
+        Some(open_log_file(&endpoint_name)?)
+    } else {
+        None
+    };
 
-    log::info!(
-        "[{}] Connecting to endpoint: {}",
-        endpoint.name,
-        endpoint.url
-    );
+    let endpoint_url = endpoint.url.clone();
 
-    let grpc_url = &endpoint.url;
-    let grpc_token = &endpoint.x_token;
-    // Connect to the gRPC server
-    let uri = grpc_url.parse::<tonic::transport::Uri>()?;
-    let mut client = EventPublisherClient::connect(uri).await?;
-    log::info!("[{}] Connected successfully", endpoint.name);
+    info!(endpoint = %endpoint_name, url = %endpoint_url, "Connecting");
 
-    let mut request = Request::new(Empty {});
-    request
-        .metadata_mut()
-        .insert("authorization", grpc_token.parse()?);
-    
-    // Subscribe to transactions stream
-    let mut stream: Streaming<StreamResponse> = client
-        .subscribe_to_transactions(request)
-        .await?
-        .into_inner();
+    let client_config = ClientConfig {
+        server_addr: endpoint_url.clone(),
+        token: endpoint.x_token.clone().unwrap_or_default(),
+        timeout: Duration::from_secs(30),
+    };
 
-    'ploop: loop {
-        tokio::select! {
+    let mut client = ThorClient::new(client_config)
+        .await
+        .unwrap_or_else(|err| fatal_connection_error(&endpoint_name, err));
+
+    info!(endpoint = %endpoint_name, "Connected");
+
+    let mut stream = client
+        .subscribe_to_transactions()
+        .await
+        .unwrap_or_else(|err| fatal_connection_error(&endpoint_name, err));
+
+    let mut accumulator = TransactionAccumulator::new();
+    let mut transaction_count = 0usize;
+
+    loop {
+        tokio::select! { biased;
             _ = shutdown_rx.recv() => {
-                log::info!("[{}] Received stop signal...", endpoint.name);
+                info!(endpoint = %endpoint_name, "Received stop signal");
                 break;
             }
 
             message = stream.next() => {
-                if let Some(Ok(msg)) = message {
-                    if let Ok(message_wrapper) = MessageWrapper::decode(&*msg.data) {
-                        if let Some(EventMessage::Transaction(transaction_event_wrapper)) = message_wrapper.event_message {
-                            if let Some(transaction_event) = transaction_event_wrapper.transaction {
-                                if let Some(transaction) = transaction_event.transaction.as_ref() {
-                                    if let Some(message) = transaction.message.as_ref() {
-                                        let accounts: Vec<String> = message.account_keys
-                                            .iter()
-                                            .map(|key| bs58::encode(key).into_string())
-                                            .collect();
-                                            
-                                        if accounts.contains(&config.account) {
-                                            let timestamp = get_current_timestamp();
-                                            let signature = bs58::encode(&transaction_event.signature).into_string();
-                                            let slot = transaction_event.slot;
+                let Some(Ok(msg)) = message else { continue };
+                let Ok(message_wrapper) = parse_message(&msg.data) else { continue };
+                let Some(EventMessage::Transaction(transaction_event_wrapper)) = message_wrapper.event_message else { continue };
+                let Some(transaction) = transaction_event_wrapper.transaction.as_ref() else { continue };
+                let Some(message) = transaction.message.as_ref() else { continue };
 
-                                            write_log_entry(&mut log_file, timestamp, &endpoint.name, &signature)?;
+                // Get signature from the first signature in the transaction
+                let Some(sig_bytes) = transaction.signatures.first() else { continue };
 
-                                            let mut comp = comparator.lock().unwrap();
+                let has_account = message
+                    .account_keys
+                    .iter()
+                    .any(|key| key.as_slice() == account_pubkey.as_ref());
 
-                                            comp.add(
-                                                endpoint.name.clone(),
-                                                TransactionData {
-                                                    timestamp,
-                                                    signature: signature.clone(),
-                                                    start_time,
-                                                },
-                                            );
+                if has_account {
+                    let wallclock = get_current_timestamp();
+                    let elapsed = start_instant.elapsed();
+                    let signature = bs58::encode(sig_bytes).into_string();
 
-                                            if comp.get_valid_count() == config.transactions as usize {
-                                                log::info!("Endpoint {} shutting down after {} transactions seen and {} by all workers",
-                                                    endpoint.name, transaction_count, config.transactions);
-                                                shutdown_tx.send(()).unwrap();
-                                                break 'ploop;
-                                            }
+                    if let Some(file) = log_file.as_mut() {
+                        write_log_entry(file, wallclock, &endpoint_name, &signature)?;
+                    }
 
-                                            log::info!("[{:.3}] [{}] {}", timestamp, endpoint.name, signature);
-                                            transaction_count += 1;
-                                        }
-                                    }
+                    let tx_data = TransactionData {
+                        wallclock_secs: wallclock,
+                        elapsed_since_start: elapsed,
+                        start_wallclock_secs,
+                    };
+
+                    let updated = accumulator.record(
+                        signature.clone(),
+                        tx_data.clone(),
+                    );
+
+                    if updated
+                        && let Some(envelope) = build_signature_envelope(
+                            &comparator,
+                            &endpoint_name,
+                            &signature,
+                            tx_data,
+                            total_producers,
+                        ) {
+                            if let Some(target) = target_transactions {
+                                let shared = shared_counter
+                                    .fetch_add(1, Ordering::AcqRel)
+                                    + 1;
+                                if let Some(tracker) = progress.as_ref() {
+                                    tracker.record(shared);
+                                }
+                                if shared >= target
+                                    && !shared_shutdown.swap(true, Ordering::AcqRel)
+                                {
+                                    info!(endpoint = %endpoint_name, target, "Reached shared signature target; broadcasting shutdown");
+                                    let _ = shutdown_tx.send(());
                                 }
                             }
+
+                            if let Some(sender) = signature_sender.as_ref() {
+                                enqueue_signature(sender, &endpoint_name, &signature, envelope);
+                            }
                         }
-                    }
+
+                    transaction_count += 1;
                 }
             }
         }
     }
 
-    log::info!("[{}] Stream closed", endpoint.name);
+    let unique_signatures = accumulator.len();
+    let collected = accumulator.into_inner();
+    comparator.add_batch(&endpoint_name, collected);
+    info!(
+        endpoint = %endpoint_name,
+        total_transactions = transaction_count,
+        unique_signatures,
+        "Stream closed after dispatching transactions"
+    );
+
     Ok(())
 }

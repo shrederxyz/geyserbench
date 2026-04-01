@@ -7,8 +7,8 @@ use tonic::transport::ClientTlsConfig;
 use tracing::{Level, error, info, warn};
 
 use crate::proto::geyser::{
-    CommitmentLevel, SubscribeRequest, SubscribeRequestFilterTransactions, SubscribeRequestPing,
-    subscribe_update::UpdateOneof,
+    SubscribePreprocessedRequest, SubscribePreprocessedRequestFilterTransactions,
+    SubscribeRequestPing, subscribe_preprocessed_update::UpdateOneof,
 };
 
 use crate::{
@@ -24,20 +24,20 @@ use super::{
     yellowstone_client::GeyserGrpcClient,
 };
 
-pub struct YellowstoneProvider;
+pub struct LaserstreamProvider;
 
-impl GeyserProvider for YellowstoneProvider {
+impl GeyserProvider for LaserstreamProvider {
     fn process(
         &self,
         endpoint: Endpoint,
         config: Config,
         context: ProviderContext,
     ) -> task::JoinHandle<Result<(), Box<dyn Error + Send + Sync>>> {
-        task::spawn(async move { process_yellowstone_endpoint(endpoint, config, context).await })
+        task::spawn(async move { process_laserstream_endpoint(endpoint, config, context).await })
     }
 }
 
-async fn process_yellowstone_endpoint(
+async fn process_laserstream_endpoint(
     endpoint: Endpoint,
     config: Config,
     context: ProviderContext,
@@ -93,33 +93,23 @@ async fn process_yellowstone_endpoint(
 
     info!(endpoint = %endpoint_name, "Connected");
 
-    let (mut subscribe_tx, mut stream) = client.subscribe().await?;
-    let commitment: CommitmentLevel = config.commitment.into();
+    let (mut subscribe_tx, mut stream) = client.subscribe_preprocessed().await?;
 
     let mut transactions = HashMap::new();
     transactions.insert(
         "account".to_string(),
-        SubscribeRequestFilterTransactions {
-            account_include: vec![config.account.clone()],
+        SubscribePreprocessedRequestFilterTransactions {
+            account_include: vec![],
             account_exclude: vec![],
-            account_required: vec![],
+            account_required: vec![config.account.clone()],
             ..Default::default()
         },
     );
 
     subscribe_tx
-        .send(SubscribeRequest {
-            slots: HashMap::default(),
-            accounts: HashMap::default(),
+        .send(SubscribePreprocessedRequest {
             transactions,
-            transactions_status: HashMap::default(),
-            entry: HashMap::default(),
-            blocks: HashMap::default(),
-            blocks_meta: HashMap::default(),
-            commitment: Some(commitment as i32),
-            accounts_data_slice: Vec::default(),
             ping: None,
-            from_slot: None,
         })
         .await?;
 
@@ -206,9 +196,9 @@ async fn process_yellowstone_endpoint(
                             },
                             Some(UpdateOneof::Ping(_)) => {
                                 subscribe_tx
-                                    .send(SubscribeRequest {
+                                    .send(SubscribePreprocessedRequest {
+                                        transactions: HashMap::default(),
                                         ping: Some(SubscribeRequestPing { id: 1 }),
-                                        ..Default::default()
                                     })
                                     .await?;
                             },

@@ -1,37 +1,52 @@
 syntax = "proto3";
 
 package shredstream;
+
 import "google/protobuf/timestamp.proto";
 
+message Socket {
+  string ip = 1;
+  int64 port = 2;
+}
 
-service ShrederService {
+message Heartbeat {
+  // don't trust IP:PORT from tcp header since it can be tampered over the wire
+  // `socket.ip` must match incoming packet's ip. this prevents spamming an unwitting destination
+  Socket socket = 1;
+
+  // regions for shredstream proxy to receive shreds from
+  // list of valid regions: https://docs.jito.wtf/lowlatencytxnsend/#api
+  repeated string regions = 2;
+}
+
+message HeartbeatResponse {
+  // client must respond within `ttl_ms` to keep stream alive
+  uint32 ttl_ms = 1;
+}
+
+service Shredstream {
+  // RPC endpoint to send heartbeats to keep shreds flowing
+  rpc SendHeartbeat (Heartbeat) returns (HeartbeatResponse) {}
+}
+
+message TraceShred {
+  // source region, one of: https://docs.jito.wtf/lowlatencytxnsend/#api
+  string region = 1;
+  // timestamp of creation
+  google.protobuf.Timestamp created_at = 2;
+  // monotonically increases, resets upon service restart
+  uint32 seq_num = 3;
+}
+
+
+// Shredstream Proxy
+
+service ShredstreamProxy {
   rpc SubscribeEntries(SubscribeEntriesRequest) returns (stream Entry);
-  rpc SubscribeTransactions(stream SubscribeTransactionsRequest) returns (stream SubscribeTransactionsResponse);
 }
 
 message SubscribeEntriesRequest {
   // tbd: we may want to add filters here
-}
-
-message SubscribeTransactionsRequest {
-  map<string, SubscribeRequestFilterTransactions> transactions = 3;
-}
-
-message SubscribeTransactionsResponse {
-  repeated string filters = 1;
-  SubscribeUpdateTransaction transaction = 4;
-  google.protobuf.Timestamp created_at = 11;
-}
-
-message SubscribeUpdateTransaction {
-  Transaction transaction = 1;
-  uint64 slot = 2;
-}
-
-message SubscribeRequestFilterTransactions {
-  repeated string account_include = 3;
-  repeated string account_exclude = 4;
-  repeated string account_required = 6;
 }
 
 message Entry {
@@ -40,36 +55,4 @@ message Entry {
 
   // Serialized bytes of Vec<Entry>: https://docs.rs/solana-entry/latest/solana_entry/entry/struct.Entry.html
   bytes entries = 2;
-}
-
-message MessageHeader {
-  uint32 num_required_signatures = 1;
-  uint32 num_readonly_signed_accounts = 2;
-  uint32 num_readonly_unsigned_accounts = 3;
-}
-
-message CompiledInstruction {
-  uint32 program_id_index = 1;
-  bytes accounts = 2;
-  bytes data = 3;
-}
-
-message MessageAddressTableLookup {
-  bytes account_key = 1;
-  bytes writable_indexes = 2;
-  bytes readonly_indexes = 3;
-}
-
-message Message {
-  MessageHeader header = 1;
-  repeated bytes account_keys = 2;
-  bytes recent_blockhash = 3;
-  repeated CompiledInstruction instructions = 4;
-  bool versioned = 5;
-  repeated MessageAddressTableLookup address_table_lookups = 6;
-}
-
-message Transaction {
-  repeated bytes signatures = 1;
-  Message message = 2;
 }

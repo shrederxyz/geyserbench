@@ -1,112 +1,72 @@
 # GeyserBench
 
-A Yellowstone Geyser gRPC endpoint benchmarking tool.
+GeyserBench benchmarks the speed and reliability of Solana gRPC-compatible data feeds so you can compare providers with consistent metrics.
 
-## Overview
+## Highlights
 
-GeyserBench is a performance testing tool that connects to multiple Solana gRPC endpoints simultaneously and measures their speed and reliability in detecting transactions.
+- Benchmark multiple feeds at once
+- Track first-detection share, latency percentiles (P50/P95/P99), valid transaction counts, and backfill events
+- Stream results to the SolStack backend for shareable reports, or keep runs local with a single flag
+- Generate a ready-to-edit TOML config on first launch; supply auth tokens and endpoints without code changes
 
-## Features
+## Quick Start
 
-- Connect to multiple gRPC endpoints simultaneously
-- Measure endpoint performance metrics:
-    - First detection rate
-    - Average delay
-    - Median and 95th percentile latency
-- Simple summary output for quick comparison
-- Detailed metrics for in-depth analysis
+1. Run the binary once to scaffold `config.toml` in the current directory:
+   ```bash
+   ./target/release/geyserbench
+   ```
+2. Edit `config.toml` with the accounts, endpoints, and tokens you want to test.
+3. Run the benchmark. Use `--config <PATH>` to point at another file or `--private` to disable backend streaming:
+   ```bash
+   ./target/release/geyserbench --private
+   ```
 
-## Installation
+During a run, GeyserBench prints progress updates followed by a side-by-side comparison table. When streaming is enabled the tool also returns a shareable link once the backend finalizes the report.
 
-### Download Binary
+## Example Output
 
-Download the latest release from the [releases page](https://github.com/solstackapp/geyserbench/releases).
+![CLI output showing endpoint win rates and latency percentiles](./assets/cli_screenshot.png)
 
-## Configuration
+## Configuration Reference
 
-When first run, GeyserBench will create a default `config.toml` file. Edit this file to customize your benchmark:
+`geyserbench` reads a single TOML file that defines the run parameters and endpoints:
 
 ```toml
 [config]
-transactions = 1000
+transactions = 10000
 account = "pAMMBay6oceH9fJKBRHGP5D4bD4sWpmSwMn52FMfXEA"
-commitment = "processed"
+commitment = "processed"  # processed | confirmed | finalized
 
 [[endpoint]]
-name = "Yellowstone GRPC"
-url = "https://api.mainnet-beta.solana.com:10000"
-x_token = "YOUR_TOKEN_HERE"
-kind = "yellowstone"
+name = "Jito Shredstream"
+url = "http://localhost:10000"
+kind = "shredstream"
 
 [[endpoint]]
-name = "Corvus ARPC"
-url = "http://0.0.0.0:20202"
-x_token = ""
-kind = "arpc"
-
-[[endpoint]]
-name = "Thor Streamer"
-url = "http://0.0.0.0:50051"
-x_token = "YOUR_TOKEN_HERE"
-kind = "thor"
-
-[[endpoint]]
-name = "Shreder.xyz"
-url = "http://0.0.0.0:10000"
-x_token = "YOUR_TOKEN_HERE"
+name = "Shreder FRA"
+url = "http://fra1.shreder.xyz:9991"
 kind = "shreder"
+
+[[endpoint]]
+name = "Shreder Binary FRA"
+url = "http://fra.binary.shreder.xyz:9991"
+kind = "shrederbinary"
+
+[[endpoint]]
+name = "Shreder Fastlane FRA"
+url = "http://fra.fastlane.shreder.xyz:10000"
+kind = "yellowstone"
 ```
 
-### Configuration Options
+- `config.transactions` sets how many signatures to evaluate (backend streaming automatically disables itself for extremely large runs).
+- `config.account` is the pubkey monitored for transactions during the benchmark.
+- `config.commitment` accepts `processed`, `confirmed`, or `finalized`.
+- Repeat `[[endpoint]]` blocks for each feed. Supported `kind` values: `yellowstone`, `arpc`, `thor`, `shredstream`, `shrederbinary`, `shreder`, and `jetstream`. `x_token` is optional.
 
-- `transactions`: Number of transactions to measure
-- `account`: Account address to monitor for transactions
-- `commitment`: Transaction commitment level (processed, confirmed, finalized)
-- `endpoint`: Array of gRPC endpoint configurations:
-    - `name`: Name for the endpoint
-    - `url`: gRPC endpoint URL
-    - `x_token`: Authentication token (if required)
-    - `kind`: Geyser provider type (yellowstone, arpc, thor, shreder, etc.)
+## CLI Options
 
-## Usage
+- `--config <PATH>` &mdash; load configuration from a different TOML file (defaults to `config.toml`).
+- `--private` &mdash; keep results local by skipping the streaming backend, even when the run qualifies for sharing.
+- `-h`, `--help` &mdash; show usage information.
 
-1. Run GeyserBench to generate the default config:
-   ```bash
-   ./geyserbench
-   ```
-
-2. Edit the generated `config.toml` file with your endpoint details
-
-3. Run the benchmark:
-   ```bash
-   ./geyserbench
-   ```
-
-## Output
-
-GeyserBench provides both simplified and detailed output:
-
-### Simple Summary
-```
-Finished tests results
-endpoint 1: Win rate 85.23%, avg delay 0.00ms (fastest)
-endpoint 2: Win rate 10.45%, avg delay 42.31ms
-endpoint 3: Win rate 4.32%, avg delay 78.56ms
-```
-
-### Detailed Metrics
-```
-Detailed tests results
-----------------------------------
-
-Fastest Endpoint: endpoint 1
-  First detections: 82 out of 97 valid transactions (84.54%)
-  
-Delays relative to fastest endpoint:
-endpoint 2:
-  Average delay: 42.31 ms
-  Median delay: 38.75 ms
-  95th percentile: 62.18 ms
-  Min/Max delay: 12.45/89.32 ms
-  Valid transactions: 97
-```
+Streaming is enabled by default for standard-sized runs and publishes to `https://runs.solstack.app`. You can always opt out with `--private` or by configuring the backend section to point at your own infrastructure.

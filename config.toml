@@ -1,0 +1,24 @@
+[config]
+transactions = 10000
+account = "pAMMBay6oceH9fJKBRHGP5D4bD4sWpmSwMn52FMfXEA"
+commitment = "processed"  # processed | confirmed | finalized
+
+[[endpoint]]
+name = "Jito Shredstream"
+url = "http://localhost:10000"
+kind = "shredstream"
+
+[[endpoint]]
+name = "Shreder FRA"
+url = "http://fra1.shreder.xyz:9991"
+kind = "shreder"
+
+[[endpoint]]
+name = "Shreder Binary FRA"
+url = "http://fra.binary.shreder.xyz:9991"
+kind = "shrederbinary"
+
+[[endpoint]]
+name = "Shreder Fastlane FRA"
+url = "http://fra.fastlane.shreder.xyz:10000"
+kind = "yellowstone"
