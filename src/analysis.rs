@@ -110,7 +110,7 @@ pub fn compute_run_summary(comparator: &Comparator, endpoint_names: &[String]) -
     let fastest_endpoint = endpoints
         .iter()
         .filter(|summary| summary.valid_transactions > 0)
-        .min_by(|a, b| compare_latency(a, b))
+        .max_by(|a, b| compare_win_rate(a, b))
         .map(|summary| summary.name.clone());
 
     RunSummary {
@@ -129,9 +129,9 @@ pub fn display_run_summary(summary: &RunSummary) {
     if !summary.has_data {
         println!("Not enough data");
     } else {
-	let fastest_name_ref = summary.fastest_endpoint.as_deref();
+        let fastest_name_ref = summary.fastest_endpoint.as_deref();
         let mut summary_rows: Vec<&EndpointSummary> = summary.endpoints.iter().collect();
-        summary_rows.sort_by(|a, b| compare_latency(a, b));
+        summary_rows.sort_by(|a, b| compare_win_rate(b, a));
 
         for summary in summary_rows {
             if summary.valid_transactions == 0 {
@@ -147,16 +147,16 @@ pub fn display_run_summary(summary: &RunSummary) {
             };
             let is_fastest = fastest_name_ref == Some(summary.name.as_str());
 
+            let p50_delay = summary
+                .p50_delay_ms
+                .map(|v| format!("{:.2}ms", v))
+                .unwrap_or_else(|| "—".to_string());
             if is_fastest {
                 println!(
-                    "{}: Win rate {}, p50 0.00ms (fastest)",
-                    summary.name, win_rate,
+                    "{}: Win rate {}, p50 {} (fastest)",
+                    summary.name, win_rate, p50_delay,
                 );
             } else {
-                let p50_delay = summary
-                    .p50_delay_ms
-                    .map(|v| format!("{:.2}ms", v))
-                    .unwrap_or_else(|| "—".to_string());
                 println!("{}: Win rate {}, p50 {}", summary.name, win_rate, p50_delay);
             }
         }
@@ -171,7 +171,7 @@ pub fn display_run_summary(summary: &RunSummary) {
     }
 
     let mut table_rows: Vec<&EndpointSummary> = summary.endpoints.iter().collect();
-    table_rows.sort_by(|a, b| compare_latency(a, b));
+    table_rows.sort_by(|a, b| compare_win_rate(b, a));
 
     let mut table = Table::new();
     table.load_preset(table_preset());
@@ -259,16 +259,11 @@ fn format_latency_value(value: Option<f64>) -> String {
         .unwrap_or_else(|| "—".to_string())
 }
 
-fn compare_latency(lhs: &EndpointSummary, rhs: &EndpointSummary) -> Ordering {
-    match (lhs.p50_delay_ms, rhs.p50_delay_ms) {
-        (Some(l), Some(r)) => l
-            .partial_cmp(&r)
-            .unwrap_or(Ordering::Equal)
-            .then_with(|| lhs.name.cmp(&rhs.name)),
-        (Some(_), None) => Ordering::Less,
-        (None, Some(_)) => Ordering::Greater,
-        (None, None) => lhs.name.cmp(&rhs.name),
-    }
+fn compare_win_rate(lhs: &EndpointSummary, rhs: &EndpointSummary) -> Ordering {
+    lhs.first_share
+        .partial_cmp(&rhs.first_share)
+        .unwrap_or(Ordering::Equal)
+        .then_with(|| lhs.name.cmp(&rhs.name))
 }
 
 fn format_percent(value: f64) -> String {

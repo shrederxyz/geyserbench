@@ -15,7 +15,10 @@ use {
     },
 };
 
-use crate::proto::geyser::{SubscribeRequest, SubscribeUpdate, geyser_client::GeyserClient};
+use crate::proto::geyser::{
+    SubscribePreprocessedRequest, SubscribePreprocessedUpdate, SubscribeRequest, SubscribeUpdate,
+    geyser_client::GeyserClient,
+};
 
 #[derive(Clone, Debug)]
 pub struct InterceptorXToken {
@@ -77,6 +80,34 @@ impl GeyserGrpcClient {
         }
         let response: Response<Streaming<SubscribeUpdate>> =
             self.geyser.subscribe(subscribe_rx).await?;
+        Ok((subscribe_tx, response.into_inner()))
+    }
+
+    pub async fn subscribe_preprocessed(
+        &mut self,
+    ) -> GeyserGrpcClientResult<(
+        impl Sink<SubscribePreprocessedRequest, Error = mpsc::SendError>,
+        impl Stream<Item = Result<SubscribePreprocessedUpdate, Status>>,
+    )> {
+        self.subscribe_preprocessed_with_request(None).await
+    }
+
+    pub async fn subscribe_preprocessed_with_request(
+        &mut self,
+        request: Option<SubscribePreprocessedRequest>,
+    ) -> GeyserGrpcClientResult<(
+        impl Sink<SubscribePreprocessedRequest, Error = mpsc::SendError>,
+        impl Stream<Item = Result<SubscribePreprocessedUpdate, Status>>,
+    )> {
+        let (mut subscribe_tx, subscribe_rx) = mpsc::unbounded();
+        if let Some(request) = request {
+            subscribe_tx
+                .send(request)
+                .await
+                .map_err(GeyserGrpcClientError::SubscribeSendError)?;
+        }
+        let response: Response<Streaming<SubscribePreprocessedUpdate>> =
+            self.geyser.subscribe_preprocessed(subscribe_rx).await?;
         Ok((subscribe_tx, response.into_inner()))
     }
 

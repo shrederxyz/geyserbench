@@ -4,21 +4,10 @@ GeyserBench benchmarks the speed and reliability of Solana gRPC-compatible data 
 
 ## Highlights
 
-- Benchmark multiple feeds at once (Yellowstone, aRPC, Thor, Shredstream, Jetstream, and custom gRPC endpoints)
+- Benchmark multiple feeds at once
 - Track first-detection share, latency percentiles (P50/P95/P99), valid transaction counts, and backfill events
 - Stream results to the SolStack backend for shareable reports, or keep runs local with a single flag
 - Generate a ready-to-edit TOML config on first launch; supply auth tokens and endpoints without code changes
-
-## Installation
-
-### Prebuilt binaries
-- Download the latest release from the [GitHub releases page](https://github.com/solstackapp/geyserbench/releases) and place the binary on your `PATH`.
-
-### Build from source
-```bash
-cargo build --release
-```
-The compiled binary is written to `target/release/geyserbench`.
 
 ## Quick Start
 
@@ -44,7 +33,7 @@ During a run, GeyserBench prints progress updates followed by a side-by-side com
 
 ```toml
 [config]
-transactions = 1000
+transactions = 10000
 account = "pAMMBay6oceH9fJKBRHGP5D4bD4sWpmSwMn52FMfXEA"
 commitment = "processed"  # processed | confirmed | finalized
 
@@ -54,21 +43,25 @@ url = "http://localhost:10000"
 kind = "shredstream"
 
 [[endpoint]]
-name = "Corvus aRPC"
-url = "https://fra.corvus-labs.io:20202"
-kind = "arpc"
+name = "Shreder FRA"
+url = "http://fra1.shreder.xyz:9991"
+kind = "shreder"
 
 [[endpoint]]
-name = "Corvus gRPC"
-url = "https://fra.corvus-labs.io:10101"
-x_token = "optional-auth-token"
+name = "Shreder Binary FRA"
+url = "http://fra.binary.shreder.xyz:9991"
+kind = "shrederbinary"
+
+[[endpoint]]
+name = "Shreder Fastlane FRA"
+url = "http://fra.fastlane.shreder.xyz:10000"
 kind = "yellowstone"
 ```
 
 - `config.transactions` sets how many signatures to evaluate (backend streaming automatically disables itself for extremely large runs).
 - `config.account` is the pubkey monitored for transactions during the benchmark.
 - `config.commitment` accepts `processed`, `confirmed`, or `finalized`.
-- Repeat `[[endpoint]]` blocks for each feed. Supported `kind` values: `yellowstone`, `arpc`, `thor`, `shredstream`, `shreder`, and `jetstream`. `x_token` is optional.
+- Repeat `[[endpoint]]` blocks for each feed. Supported `kind` values: `yellowstone`, `arpc`, `thor`, `shredstream`, `shrederbinary`, `shreder`, and `jetstream`. `x_token` is optional.
 
 ## CLI Options
 
