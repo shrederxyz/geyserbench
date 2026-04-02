@@ -1,6 +1,5 @@
-use dashmap::{DashMap, DashSet};
 use std::{
-    collections::HashMap,
+    collections::{HashMap, HashSet},
     fs::OpenOptions,
     io::Write,
     sync::atomic::{AtomicUsize, Ordering},
@@ -17,27 +16,26 @@ pub struct TransactionData {
 
 #[derive(Debug)]
 pub struct Comparator {
-    data: DashMap<String, HashMap<String, TransactionData>>,
-    emitted: DashSet<String>,
+    data: HashMap<String, HashMap<String, TransactionData>>,
+    emitted: HashSet<String>,
 }
 
 impl Comparator {
     pub fn new() -> Self {
         Self {
-            data: DashMap::new(),
-            emitted: DashSet::new(),
+            data: HashMap::new(),
+            emitted: HashSet::new(),
         }
     }
 
-    pub fn add_batch(&self, from: &str, transactions: HashMap<String, TransactionData>) {
+    pub fn add_batch(&mut self, from: &str, transactions: HashMap<String, TransactionData>) {
         for (signature, data) in transactions {
-            let mut entry = self.data.entry(signature).or_default();
-            entry.insert(from.to_owned(), data);
+            self.data.entry(signature).or_default().insert(from.to_owned(), data);
         }
     }
 
     pub fn record_observation(
-        &self,
+        &mut self,
         endpoint: &str,
         signature: &str,
         data: TransactionData,
@@ -47,7 +45,7 @@ impl Comparator {
             return None;
         }
 
-        let mut entry = self.data.entry(signature.to_owned()).or_default();
+        let entry = self.data.entry(signature.to_owned()).or_default();
 
         let mut updated = false;
         entry
@@ -72,7 +70,6 @@ impl Comparator {
         }
 
         let snapshot = entry.clone();
-        drop(entry);
 
         if self.emitted.insert(signature.to_owned()) {
             Some(snapshot)
@@ -81,7 +78,7 @@ impl Comparator {
         }
     }
 
-    pub fn iter(&self) -> dashmap::iter::Iter<'_, String, HashMap<String, TransactionData>> {
+    pub fn iter(&self) -> impl Iterator<Item = (&String, &HashMap<String, TransactionData>)> {
         self.data.iter()
     }
 }

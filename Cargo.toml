@@ -21,7 +21,6 @@ solana-entry = "2"
 solana-pubkey = "2"
 solana-transaction = "2"
 lazy_static = "1.5.0"
-dashmap = "6"
 comfy-table = "7.1.0"
 anyhow = "1"
 tokio-tungstenite = { version = "0.23", features = ["rustls-tls-webpki-roots"] }

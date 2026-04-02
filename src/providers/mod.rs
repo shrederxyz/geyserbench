@@ -1,18 +1,14 @@
-use crossbeam_queue::ArrayQueue;
 use std::{
     error::Error,
-    sync::{
-        Arc,
-        atomic::{AtomicBool, AtomicUsize},
-    },
+    sync::mpsc,
+    thread,
     time::Instant,
 };
 use tokio::sync::broadcast;
 
 use crate::{
-    backend::SignatureEnvelope,
+    aggregator::AggregatorMessage,
     config::{Config, Endpoint, EndpointKind},
-    utils::{Comparator, ProgressTracker},
 };
 
 pub mod arpc;
@@ -32,7 +28,7 @@ pub trait GeyserProvider: Send + Sync {
         endpoint: Endpoint,
         config: Config,
         context: ProviderContext,
-    ) -> tokio::task::JoinHandle<Result<(), Box<dyn Error + Send + Sync>>>;
+    ) -> thread::JoinHandle<Result<(), Box<dyn Error + Send + Sync>>>;
 }
 
 pub fn create_provider(kind: &EndpointKind) -> Box<dyn GeyserProvider> {
@@ -53,11 +49,5 @@ pub struct ProviderContext {
     pub shutdown_rx: broadcast::Receiver<()>,
     pub start_wallclock_secs: f64,
     pub start_instant: Instant,
-    pub comparator: Arc<Comparator>,
-    pub signature_tx: Option<Arc<ArrayQueue<SignatureEnvelope>>>,
-    pub shared_counter: Arc<AtomicUsize>,
-    pub shared_shutdown: Arc<AtomicBool>,
-    pub target_transactions: Option<usize>,
-    pub total_producers: usize,
-    pub progress: Option<Arc<ProgressTracker>>,
+    pub observation_tx: mpsc::Sender<AggregatorMessage>,
 }

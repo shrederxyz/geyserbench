@@ -8,6 +8,7 @@ pub use {
         sync::{
             Arc,
             atomic::{AtomicBool, AtomicUsize, Ordering},
+            mpsc as std_mpsc,
         },
         thread,
         time::{Duration, Instant},
@@ -15,6 +16,7 @@ pub use {
     tokio::{signal::ctrl_c, sync::broadcast, task},
 };
 
+mod aggregator;
 mod analysis;
 mod backend;
 mod config;
@@ -27,7 +29,7 @@ use backend::{BackendStatus, StreamOptions};
 use crossbeam_queue::ArrayQueue;
 use tracing::{debug, error, info, warn};
 use tracing_subscriber::EnvFilter;
-use utils::{Comparator, ProgressTracker, get_current_timestamp};
+use utils::{ProgressTracker, get_current_timestamp};
 const DEFAULT_CONFIG_PATH: &str = "config.toml";
 const DEFAULT_BACKEND_STREAM_URL: &str = "wss://gb.solstack.app/v1/benchmarks/stream";
 const MAX_STREAM_TRANSACTIONS: i32 = 100_000;
@@ -97,7 +99,6 @@ async fn main() -> Result<()> {
     let (shutdown_tx, _) = broadcast::channel::<()>(1);
 
     let start_time_local = get_current_timestamp();
-    let comparator = Arc::new(Comparator::new());
     let start_instant = Instant::now();
     let clock_offset_ms: f64;
     let server_started_at_unix_ms: Option<i64>;
@@ -119,7 +120,7 @@ async fn main() -> Result<()> {
     backend_settings.url = Some(DEFAULT_BACKEND_STREAM_URL.to_string());
 
     let mut backend_handle = None;
-    let mut signature_queues: Option<Vec<Arc<ArrayQueue<backend::SignatureEnvelope>>>> = None;
+    let mut signature_queue: Option<Arc<ArrayQueue<backend::SignatureEnvelope>>> = None;
     let mut signature_forwarder: Option<thread::JoinHandle<()>> = None;
     let mut forwarder_stop: Option<Arc<AtomicBool>> = None;
     let mut backend_run_id = None;
@@ -142,12 +143,9 @@ async fn main() -> Result<()> {
         );
         backend_run_id = Some(run_id.clone());
 
-        let mut queues = Vec::with_capacity(config.endpoint.len());
-        for _ in 0..config.endpoint.len() {
-            queues.push(Arc::new(ArrayQueue::new(SIGNATURE_QUEUE_CAPACITY)));
-        }
-        let queue_handles = queues.iter().map(Arc::clone).collect::<Vec<_>>();
-        signature_queues = Some(queues);
+        let queue = Arc::new(ArrayQueue::new(SIGNATURE_QUEUE_CAPACITY));
+        let queue_handle = queue.clone();
+        signature_queue = Some(queue);
 
         let mut status_rx = handle.status();
         let shutdown_for_backend = shutdown_tx.clone();
@@ -174,21 +172,19 @@ async fn main() -> Result<()> {
         let stop_flag = Arc::new(AtomicBool::new(false));
         forwarder_stop = Some(stop_flag.clone());
         let forwarder = thread::spawn(move || {
-            let queue_handles = queue_handles;
+            let queue = queue_handle;
             loop {
                 let mut did_work = false;
-                for queue in &queue_handles {
-                    while let Some(envelope) = queue.pop() {
-                        did_work = true;
-                        if backend_sender.blocking_send(envelope).is_err() {
-                            warn!(run_id = %run_id_for_forwarder, "Failed to forward signature to backend");
-                            return;
-                        }
+                while let Some(envelope) = queue.pop() {
+                    did_work = true;
+                    if backend_sender.blocking_send(envelope).is_err() {
+                        warn!(run_id = %run_id_for_forwarder, "Failed to forward signature to backend");
+                        return;
                     }
                 }
 
                 let should_stop = stop_flag.load(Ordering::Acquire);
-                if should_stop && queue_handles.iter().all(|queue| queue.is_empty()) {
+                if should_stop && queue.is_empty() {
                     break;
                 }
 
@@ -203,7 +199,9 @@ async fn main() -> Result<()> {
         info!("Backend streaming disabled; collecting metrics locally");
     }
 
-    let mut handles = Vec::new();
+    // Create observation channel for providers -> aggregator
+    let (observation_tx, observation_rx) = std_mpsc::channel::<aggregator::AggregatorMessage>();
+
     let endpoint_names: Vec<String> = config.endpoint.iter().map(|e| e.name.clone()).collect();
     let global_target = if config.config.transactions > 0 {
         Some(config.config.transactions as usize)
@@ -213,28 +211,47 @@ async fn main() -> Result<()> {
     let progress_tracker = global_target.map(|target| Arc::new(ProgressTracker::new(target)));
 
     let total_producers = config.endpoint.len();
-    for (index, endpoint) in config.endpoint.clone().into_iter().enumerate() {
+
+    // Spawn aggregator in dedicated OS thread
+    let aggregator_shutdown_tx = shutdown_tx.clone();
+    let aggregator_shared_counter = shared_counter.clone();
+    let aggregator_shared_shutdown = shared_shutdown.clone();
+    let aggregator_progress = progress_tracker.clone();
+    let aggregator_signature_tx = signature_queue.clone();
+    let aggregator_handle = thread::Builder::new()
+        .name("aggregator".to_string())
+        .spawn(move || {
+            aggregator::run_aggregator(aggregator::AggregatorConfig {
+                rx: observation_rx,
+                shutdown_tx: aggregator_shutdown_tx,
+                shared_counter: aggregator_shared_counter,
+                shared_shutdown: aggregator_shared_shutdown,
+                target_transactions: global_target,
+                total_producers,
+                progress: aggregator_progress,
+                signature_tx: aggregator_signature_tx,
+            })
+        })
+        .expect("failed to spawn aggregator thread");
+
+    // Spawn providers in dedicated OS threads
+    let mut handles = Vec::new();
+    for (_index, endpoint) in config.endpoint.clone().into_iter().enumerate() {
         let provider = providers::create_provider(&endpoint.kind);
         let shared_config = config.config.clone();
-        let signature_queue = signature_queues
-            .as_ref()
-            .and_then(|queues| queues.get(index).cloned());
         let context = providers::ProviderContext {
             shutdown_tx: shutdown_tx.clone(),
             shutdown_rx: shutdown_tx.subscribe(),
             start_wallclock_secs: start_time_local,
             start_instant,
-            comparator: comparator.clone(),
-            signature_tx: signature_queue,
-            shared_counter: shared_counter.clone(),
-            shared_shutdown: shared_shutdown.clone(),
-            target_transactions: global_target,
-            total_producers,
-            progress: progress_tracker.clone(),
+            observation_tx: observation_tx.clone(),
         };
 
         handles.push(provider.process(endpoint, shared_config, context));
     }
+
+    // Drop our copy of the sender so aggregator sees channel close when all providers finish
+    drop(observation_tx);
 
     tokio::spawn({
         let shutdown_tx = shutdown_tx.clone();
@@ -257,19 +274,35 @@ async fn main() -> Result<()> {
         }
     });
 
-    for handle in handles {
-        match handle.await {
-            Ok(Ok(_)) => {}
-            Ok(Err(e)) => error!(error = ?e, "Provider task returned error"),
-            Err(e) => error!(error = ?e, "Provider join error"),
+    // Wait for all provider threads to finish (in a blocking context)
+    let join_result = task::spawn_blocking(move || {
+        for handle in handles {
+            match handle.join() {
+                Ok(Ok(_)) => {}
+                Ok(Err(e)) => error!(error = ?e, "Provider task returned error"),
+                Err(e) => error!(error = ?e, "Provider join error"),
+            }
         }
+    })
+    .await;
+
+    if let Err(e) = join_result {
+        error!(error = ?e, "Failed to join provider threads");
     }
+
+    // Wait for aggregator to finish and return the Comparator
+    let comparator = task::spawn_blocking(move || {
+        aggregator_handle
+            .join()
+            .expect("aggregator thread panicked")
+    })
+    .await?;
 
     let run_aborted = aborted.load(Ordering::Acquire);
 
     let run_summary = if !run_aborted {
         Some(analysis::compute_run_summary(
-            comparator.as_ref(),
+            &comparator,
             &endpoint_names,
         ))
     } else {
@@ -283,7 +316,6 @@ async fn main() -> Result<()> {
             } else {
                 info!("Skipping backend finalisation due to user abort");
             }
-            // Dropping the handle without calling finish() prevents the backend run from being saved.
         } else {
             let run_id = backend_run_id
                 .clone()
@@ -300,7 +332,7 @@ async fn main() -> Result<()> {
         }
     }
 
-    let _ = signature_queues.take();
+    let _ = signature_queue.take();
     if let Some(stop) = forwarder_stop.as_ref() {
         stop.store(true, Ordering::Release);
     }

@@ -1,12 +1,8 @@
-use std::{collections::HashMap, sync::Arc};
+use std::collections::HashMap;
 
-use crossbeam_queue::ArrayQueue;
-use tracing::{error, warn};
+use tracing::error;
 
-use crate::{
-    backend::{SignatureEnvelope, SignatureObservation},
-    utils::{Comparator, TransactionData},
-};
+use crate::utils::TransactionData;
 
 #[derive(Default)]
 pub struct TransactionAccumulator {
@@ -54,39 +50,3 @@ pub fn fatal_connection_error(endpoint: &str, err: impl std::fmt::Display) -> ! 
     std::process::exit(1);
 }
 
-pub fn build_signature_envelope(
-    comparator: &Arc<Comparator>,
-    endpoint: &str,
-    signature: &str,
-    data: TransactionData,
-    total_producers: usize,
-) -> Option<SignatureEnvelope> {
-    comparator
-        .record_observation(endpoint, signature, data, total_producers)
-        .map(|observations| {
-            let mut payload = observations
-                .into_iter()
-                .map(|(endpoint, tx_data)| SignatureObservation {
-                    endpoint,
-                    timestamp: tx_data.wallclock_secs,
-                    backfilled: tx_data.wallclock_secs < tx_data.start_wallclock_secs,
-                })
-                .collect::<Vec<_>>();
-            payload.sort_by(|lhs, rhs| lhs.endpoint.cmp(&rhs.endpoint));
-            SignatureEnvelope {
-                signature: signature.to_owned(),
-                observations: payload,
-            }
-        })
-}
-
-pub fn enqueue_signature(
-    sender: &Arc<ArrayQueue<SignatureEnvelope>>,
-    endpoint: &str,
-    signature: &str,
-    envelope: SignatureEnvelope,
-) {
-    if sender.push(envelope).is_err() {
-        warn!(endpoint = endpoint, signature = %signature, "Signature queue full; dropping observation");
-    }
-}
