@@ -23,10 +23,6 @@ GeyserBench benchmarks the speed and reliability of Solana gRPC-compatible data 
 
 During a run, GeyserBench prints progress updates followed by a side-by-side comparison table. When streaming is enabled the tool also returns a shareable link once the backend finalizes the report.
 
-## Example Output
-
-![CLI output showing endpoint win rates and latency percentiles](./assets/cli_screenshot.png)
-
 ## Configuration Reference
 
 `geyserbench` reads a single TOML file that defines the run parameters and endpoints:
