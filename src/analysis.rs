@@ -56,8 +56,7 @@ pub fn compute_run_summary(comparator: &Comparator, endpoint_names: &[String]) -
         endpoint_stats.insert(endpoint_name.clone(), EndpointStats::default());
     }
 
-    for sig_entry in comparator.iter() {
-        let sig_data = sig_entry.value();
+    for (_sig, sig_data) in comparator.iter() {
         if expected_producers > 0 && sig_data.len() != expected_producers {
             // Skip partial observations to mirror backend results
             continue;

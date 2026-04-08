@@ -1,20 +1,18 @@
 use futures::{SinkExt, channel::mpsc::unbounded};
 use futures_util::stream::StreamExt;
 use solana_pubkey::Pubkey;
-use std::{collections::HashMap, error::Error, sync::atomic::Ordering};
-use tokio::task;
-use tracing::{Level, info, trace};
+use std::{collections::HashMap, error::Error};
+use tracing::{Level, error, info, trace};
 
 use crate::{
+    aggregator::AggregatorMessage,
     config::{Config, Endpoint},
     utils::{TransactionData, get_current_timestamp, open_log_file, write_log_entry},
 };
 
 use super::{
     GeyserProvider, ProviderContext,
-    common::{
-        TransactionAccumulator, build_signature_envelope, enqueue_signature, fatal_connection_error,
-    },
+    common::{TransactionAccumulator, fatal_connection_error},
 };
 
 #[allow(clippy::all, dead_code)]
@@ -35,8 +33,23 @@ impl GeyserProvider for ShrederProvider {
         endpoint: Endpoint,
         config: Config,
         context: ProviderContext,
-    ) -> task::JoinHandle<Result<(), Box<dyn Error + Send + Sync>>> {
-        task::spawn(async move { process_shredstream_endpoint(endpoint, config, context).await })
+    ) -> std::thread::JoinHandle<Result<(), Box<dyn Error + Send + Sync>>> {
+        let shutdown_tx = context.shutdown_tx.clone();
+        let endpoint_name_for_log = endpoint.name.clone();
+        std::thread::Builder::new()
+            .name(format!("provider-{}", endpoint.name))
+            .spawn(move || {
+                let rt = tokio::runtime::Builder::new_current_thread()
+                    .enable_all()
+                    .build()?;
+                let result = rt.block_on(process_shredstream_endpoint(endpoint, config, context));
+                if result.is_err() {
+                    error!(endpoint = %endpoint_name_for_log, "Provider failed; broadcasting shutdown");
+                    let _ = shutdown_tx.send(());
+                }
+                result
+            })
+            .expect("failed to spawn provider thread")
     }
 }
 
@@ -46,19 +59,12 @@ async fn process_shredstream_endpoint(
     context: ProviderContext,
 ) -> Result<(), Box<dyn Error + Send + Sync>> {
     let ProviderContext {
-        shutdown_tx,
+        shutdown_tx: _,
         mut shutdown_rx,
         start_wallclock_secs,
         start_instant,
-        comparator,
-        signature_tx,
-        shared_counter,
-        shared_shutdown,
-        target_transactions,
-        total_producers,
-        progress,
+        observation_tx,
     } = context;
-    let signature_sender = signature_tx;
     let account_pubkey = config.account.parse::<Pubkey>()?;
     let endpoint_name = endpoint.name.clone();
 
@@ -143,27 +149,12 @@ async fn process_shredstream_endpoint(
 
                 let updated = accumulator.record(signature.clone(), tx_data.clone());
 
-                if updated && let Some(envelope) = build_signature_envelope(
-                    &comparator,
-                    &endpoint_name,
-                    &signature,
-                    tx_data,
-                    total_producers,
-                ) {
-                    if let Some(target) = target_transactions {
-                        let shared = shared_counter.fetch_add(1, Ordering::AcqRel) + 1;
-                        if let Some(tracker) = progress.as_ref() {
-                            tracker.record(shared);
-                        }
-                        if shared >= target && !shared_shutdown.swap(true, Ordering::AcqRel) {
-                            info!(endpoint = %endpoint_name, target, "Reached shared signature target; broadcasting shutdown");
-                            let _ = shutdown_tx.send(());
-                        }
-                    }
-
-                    if let Some(sender) = signature_sender.as_ref() {
-                        enqueue_signature(sender, &endpoint_name, &signature, envelope);
-                    }
+                if updated {
+                    let _ = observation_tx.send(AggregatorMessage::Observation {
+                        endpoint: endpoint_name.clone(),
+                        signature: signature.clone(),
+                        data: tx_data,
+                    });
                 }
 
                 transaction_count += 1;
@@ -173,7 +164,10 @@ async fn process_shredstream_endpoint(
 
     let unique_signatures = accumulator.len();
     let collected = accumulator.into_inner();
-    comparator.add_batch(&endpoint_name, collected);
+    let _ = observation_tx.send(AggregatorMessage::Batch {
+        endpoint: endpoint_name.clone(),
+        transactions: collected,
+    });
     info!(
         endpoint = %endpoint_name,
         total_transactions = transaction_count,
